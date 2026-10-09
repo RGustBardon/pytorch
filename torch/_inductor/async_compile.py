@@ -995,6 +995,8 @@ class AsyncCompile:
         has_output_scale=False,
         swap_ab=False,
         metadata=None,
+        *,
+        symbolic_shapes: bool = False,
     ):
         """Submit NVGEMM kernel precompilation to the subprocess pool.
 
@@ -1003,9 +1005,16 @@ class AsyncCompile:
         artifact is saved to the disk cache; the main process loads it on the
         next cache lookup during benchmarking.
         """
+        from cutlass.operators.config import GlobalOptions
+
         from torch._inductor.codegen.nv_universal_gemm.nv_universal_gemm_kernel import (
             _worker_nvgemm_autotuning_precompile,
         )
+
+        if not GlobalOptions().use_tvm_ffi:
+            future = Future()
+            future.set_result((None, 0))
+            return future
 
         extra_env = _pycodecache_kernel_compile_env()
 
@@ -1026,6 +1035,7 @@ class AsyncCompile:
             has_output_scale,
             swap_ab,
             metadata,
+            symbolic_shapes,
         )
 
     def metal(self, kernel_name: str, source: str, headers: list[str]) -> None:

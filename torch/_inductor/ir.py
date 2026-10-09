@@ -6808,6 +6808,8 @@ class NVUniversalGemmBuffer(TemplateBuffer):
         swap_ab: bool = False,
         bias_node: Buffer | None = None,
         output_scale_node: Buffer | None = None,
+        *,
+        symbolic_shapes: bool = False,
     ) -> None:
         # We pass None initially, then override with our method below
         super().__init__(layout, inputs, make_kernel_render=None)
@@ -6822,6 +6824,7 @@ class NVUniversalGemmBuffer(TemplateBuffer):
         self.swizzle_type_b = swizzle_type_b
         self.supports_epilogue_fusion = supports_epilogue_fusion
         self.swap_ab = swap_ab
+        self.symbolic_shapes = symbolic_shapes
         # When set, the last entry of `inputs` is an addmm bias consumed as a
         # fixed bias-add epilogue; the GEMM operands are the remaining inputs.
         self.bias_node = bias_node
@@ -6916,6 +6919,7 @@ class NVUniversalGemmBuffer(TemplateBuffer):
             swap_ab=self.swap_ab,
             bias_node=bias_node,
             output_scale_node=output_scale_node,
+            symbolic_shapes=self.symbolic_shapes,
         )
 
         def render():

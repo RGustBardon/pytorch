@@ -11,6 +11,8 @@ import re
 from enum import auto, Enum
 from typing import Any, Literal
 
+import sympy
+
 import torch
 from torch._inductor import config
 from torch._inductor.autotune_process import (
@@ -28,6 +30,7 @@ from torch._inductor.codegen.nv_universal_gemm.nv_universal_gemm_kernel import (
     _make_disk_config_key,
     _NVGEMM_BIAS_ADD_EPILOGUE_FINGERPRINT,
     _NVGEMM_BIAS_ADD_EPILOGUE_SOURCE,
+    _nvgemm_disk_cache_set,
     _rewrap_efc_compiled_obj,
     _unwrap_efc_compiled_obj,
     CuTeDSLEpilogueArguments,
@@ -56,6 +59,10 @@ from torch._inductor.kernel_inputs import MMKernelInputs
 from torch._inductor.utils import ensure_nv_universal_gemm_available
 from torch._inductor.virtualized import V
 from torch._logging import getArtifactLogger
+from torch.fx.experimental.symbolic_shapes import (
+    free_unbacked_symbols,
+    has_free_symbols,
+)
 
 
 log = getArtifactLogger(__name__, "output_code")
@@ -113,6 +120,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         swap_ab: bool = False,
         has_bias_epilogue: bool = False,
         has_output_scale: bool = False,
+        symbolic_shapes: bool = False,
     ) -> None:
         super().__init__(kernel_name, input_tensor_meta, output_tensor_meta, ())
         self.kernel = kernel
@@ -128,6 +136,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         self.swizzle_type_a = swizzle_type_a
         self.swizzle_type_b = swizzle_type_b
         self.swap_ab = swap_ab
+        self.symbolic_shapes = symbolic_shapes
         input_dtype_b = (
             self.input_tensor_meta[1].dtype if len(self.input_tensor_meta) > 1 else None
         )
@@ -198,7 +207,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         """Create a function to run the NVIDIA Universal GEMM kernel."""
         from cutlass.operators.artifact import CompiledArtifact
 
-        from torch._inductor.runtime.cutedsl_cache import disk_cache_get, disk_cache_set
+        from torch._inductor.runtime.cutedsl_cache import disk_cache_get
         from torch._inductor.utils import _ensure_fp4_dtype_registered
 
         _ensure_fp4_dtype_registered()
@@ -244,7 +253,12 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
                 }
             )
 
-        cache_key = _create_gemm_cache_key(input_tensors, out, logical_m=logical_m)
+        cache_key = _create_gemm_cache_key(
+            input_tensors,
+            out,
+            logical_m=logical_m,
+            symbolic_shapes=self.symbolic_shapes,
+        )
         dev_idx = input_tensors[0].device.index or 0
         kernel_name = self.kernel.metadata.operator_name
         disk_config_key = _make_disk_config_key(
@@ -287,7 +301,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
 
         if was_compiled:
             obj = _unwrap_efc_compiled_obj(artifact.compiled_obj)
-            disk_cache_set(
+            _nvgemm_disk_cache_set(
                 self._disk_fn_cache,
                 kernel_name,
                 disk_config_key,
@@ -328,7 +342,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         """
         from cutlass.operators.artifact import CompiledArtifact
 
-        from torch._inductor.runtime.cutedsl_cache import disk_cache_get, disk_cache_set
+        from torch._inductor.runtime.cutedsl_cache import disk_cache_get
 
         *gemm_tensors, bias = input_tensors
         gemm_tensors = tuple(gemm_tensors)
@@ -344,6 +358,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
             aux_tensors=(bias,),
             epilogue_source=_NVGEMM_BIAS_ADD_EPILOGUE_FINGERPRINT,
             logical_m=out.shape[-2],
+            symbolic_shapes=self.symbolic_shapes,
         )
         dev_idx = gemm_tensors[0].device.index or 0
         disk_config_key = _make_disk_config_key(
@@ -386,7 +401,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         )
 
         if was_compiled:
-            disk_cache_set(
+            _nvgemm_disk_cache_set(
                 self._disk_fn_cache,
                 kernel_name,
                 disk_config_key,
@@ -474,8 +489,17 @@ class NVUniversalGemmCaller(ChoiceCaller):
         self.output_scale_node = output_scale_node
         self._kernel_layout = kernel_layout or layout
         self._cached_output_node: TensorBox | None = None
+        operand_layouts = [(node.get_size(), node.get_stride()) for node in input_nodes]
+        self.symbolic_shapes = (
+            variant == GemmVariant.GEMM
+            and len(layout.size) == 2
+            and bias_node is None
+            and has_free_symbols((operand_layouts, layout.size, layout.stride))
+        )
 
         output_buffer = Buffer(name=f"{variant.op_name}_out", layout=layout)
+
+        self.supports_epilogue_fusion &= not self.symbolic_shapes
 
         self.bmreq = NVUniversalGemmBenchmarkRequest(
             kernel_name=name,
@@ -492,6 +516,7 @@ class NVUniversalGemmCaller(ChoiceCaller):
             swap_ab=swap_ab,
             has_bias_epilogue=bias_node is not None,
             has_output_scale=output_scale_node is not None,
+            symbolic_shapes=self.symbolic_shapes,
         )
 
     def __str__(self) -> str:
@@ -504,8 +529,199 @@ class NVUniversalGemmCaller(ChoiceCaller):
         self.bmreq.benchmark_with_cudagraphs = self._benchmark_with_cudagraphs
         return self.bmreq.benchmark(*args, out=out)
 
-    def output_node(self) -> TensorBox:
+    @staticmethod
+    def _constraint_major_dim(size, stride, constraint) -> int:
+        expected_stride = constraint.stride
+        if expected_stride is None:
+            hinted_size = V.graph.sizevars.optimization_hints(size)
+            hinted_stride = V.graph.sizevars.optimization_hints(stride)
+            major_dim = next(
+                (
+                    dim
+                    for dim, (extent, step) in enumerate(
+                        zip(hinted_size, hinted_stride, strict=True)
+                    )
+                    if extent > 1 and step == 1
+                ),
+                len(size) - 1 if all(extent == 1 for extent in hinted_size) else None,
+            )
+            if major_dim is None:
+                raise AssertionError("selected NVGEMM operand has no contiguous mode")
+        else:
+            if len(expected_stride) == len(stride):
+                normalized_stride = expected_stride
+            elif len(expected_stride) - 1 == len(stride):
+                normalized_stride = expected_stride[1:]
+            else:
+                raise AssertionError(
+                    "selected NVGEMM operand constraint has incompatible rank"
+                )
+            major_dim = normalized_stride.index(1)
+        return major_dim
+
+    @classmethod
+    def _tensor_constraint_checks(cls, size, stride, offset, itemsize, constraint):
+        major_dim = cls._constraint_major_dim(size, stride, constraint)
+        yield (
+            sympy.Eq(stride[major_dim], 1),
+            "selected NVGEMM operand is not contiguous",
+        )
+        if constraint.divisibility > 1:
+            yield (
+                sympy.Eq(sympy.Mod(size[major_dim], constraint.divisibility), 0),
+                "selected NVGEMM operand extent violates alignment",
+            )
+            for dim, step in enumerate(stride):
+                if dim != major_dim:
+                    yield (
+                        sympy.Eq(sympy.Mod(step, constraint.divisibility), 0),
+                        "selected NVGEMM operand stride violates alignment",
+                    )
+        if constraint.ptr_alignment_bytes > 1:
+            offset_bytes = offset * itemsize
+            yield (
+                sympy.Eq(sympy.Mod(offset_bytes, constraint.ptr_alignment_bytes), 0),
+                "selected NVGEMM operand pointer is misaligned",
+            )
+
+    @classmethod
+    def _tensor_constraint_satisfied(
+        cls, size, stride, offset, itemsize, constraint
+    ) -> bool:
+        if free_unbacked_symbols((size, stride, offset)):
+            return False
+        return all(
+            cls._shape_constraint_satisfied(condition)
+            for condition, _ in cls._tensor_constraint_checks(
+                size, stride, offset, itemsize, constraint
+            )
+        )
+
+    @classmethod
+    def _guard_tensor_constraint(
+        cls, size, stride, offset, itemsize, constraint
+    ) -> None:
+        for condition, message in cls._tensor_constraint_checks(
+            size, stride, offset, itemsize, constraint
+        ):
+            if not cls._guard_or_prove_shape_constraint(condition):
+                raise AssertionError(message)
+
+    @staticmethod
+    def _can_add_shape_guards() -> bool:
+        import torch.fx.experimental._config as exp_config
+
+        shape_env = V.graph.sizevars.shape_env
+        return not shape_env.frozen and not exp_config.backed_size_oblivious
+
+    @classmethod
+    def _shape_constraint_satisfied(cls, condition) -> bool:
+        sizevars = V.graph.sizevars
+        if not cls._can_add_shape_guards():
+            return sizevars.statically_known_true(condition)
+        symbols = tuple(condition.free_symbols)
+        hints = sizevars.optimization_hints(symbols)
+        return condition.xreplace(dict(zip(symbols, hints, strict=True))) is sympy.true
+
+    @classmethod
+    def _guard_or_prove_shape_constraint(cls, condition) -> bool:
+        sizevars = V.graph.sizevars
+        if not cls._can_add_shape_guards():
+            return sizevars.statically_known_true(condition)
+        return sizevars.guard_or_false(condition)
+
+    @staticmethod
+    def _tensor_geometry(node, transpose: bool = False):
+        size = list(node.get_size())
+        stride = list(node.get_stride())
+        if transpose:
+            size[-2:] = reversed(size[-2:])
+            stride[-2:] = reversed(stride[-2:])
+        return size, stride
+
+    def _operand_constraints(self):
+        if self.variant != GemmVariant.GEMM:
+            return
+
+        operands = self.kernel.metadata.operands
+        a_idx, b_idx = (1, 0) if self.swap_ab else (0, 1)
+        for node, constraint in (
+            (self.input_nodes[a_idx], operands.A),
+            (self.input_nodes[b_idx], operands.B),
+        ):
+            size, stride = self._tensor_geometry(node, self.swap_ab)
+            yield (
+                size,
+                stride,
+                node.get_layout().offset,
+                node.get_dtype().itemsize,
+                constraint,
+            )
+        yield (
+            self._kernel_layout.size,
+            self._kernel_layout.stride,
+            self._kernel_layout.offset,
+            self._kernel_layout.dtype.itemsize,
+            operands.out,
+        )
+
+    def _guard_dynamic_shape_constraints(self) -> None:
+        for geometry in self._operand_constraints():
+            self._guard_tensor_constraint(*geometry)
+        for condition, message in self._problem_shape_checks():
+            if not self._guard_or_prove_shape_constraint(condition):
+                raise AssertionError(message)
+
+    def _problem_shape_checks(self):
+        if self.variant != GemmVariant.GEMM:
+            return
+        if minimums := self._preferred_cluster_minimums():
+            for extent, minimum in zip(
+                self._kernel_layout.size[-2:], minimums, strict=True
+            ):
+                yield (
+                    sympy.Ge(extent, minimum),
+                    "selected NVGEMM preferred cluster exceeds problem shape",
+                )
+
+    def _preferred_cluster_minimums(self) -> tuple[int, int] | None:
+        design = self.kernel.metadata.design
+        if getattr(design, "fallback_cluster_shape", None) is None:
+            return None
+        return (
+            design.tile_shape[0] * design.cluster_shape[0],
+            design.tile_shape[1] * design.cluster_shape[1],
+        )
+
+    def _supports_current_shape_constraints(self) -> bool:
+        # Current dense providers use zero workspace; symbolic wrappers require
+        # guards that imply their 16-byte pointer and compact-layout contracts.
+        if self.symbolic_shapes and self.workspace_size != 0:
+            return False
+        for geometry in self._operand_constraints():
+            _, _, _, itemsize, constraint = geometry
+            if self.symbolic_shapes:
+                alignment = constraint.ptr_alignment_bytes
+                divisibility_bytes = constraint.divisibility * itemsize
+                if (
+                    alignment < 16
+                    or alignment % 16
+                    or divisibility_bytes < 16
+                    or divisibility_bytes % 16
+                ):
+                    return False
+            if not self._tensor_constraint_satisfied(*geometry):
+                return False
+        return all(
+            self._shape_constraint_satisfied(condition)
+            for condition, _ in self._problem_shape_checks()
+        )
+
+    def output_node(self, *, install_guards: bool = True) -> TensorBox:
         from torch._inductor.ir import NVUniversalGemmBuffer
+
+        if install_guards:
+            self._guard_dynamic_shape_constraints()
 
         # Without memoization, each call registers a new buffer (via
         # TemplateBuffer.__init__ → V.graph.register_buffer), leaking orphan
@@ -543,6 +759,7 @@ class NVUniversalGemmCaller(ChoiceCaller):
             swap_ab=self.swap_ab,
             bias_node=self.bias_node,
             output_scale_node=self.output_scale_node,
+            symbolic_shapes=self.symbolic_shapes,
         )
         if "ktc" in self.annotations:
             buffer.annotations["ktc"] = self.annotations["ktc"]
@@ -639,6 +856,7 @@ class NVUniversalGemmCaller(ChoiceCaller):
         swap_ab = self.swap_ab
         has_bias = self.bias_node is not None
         has_output_scale = self.output_scale_node is not None
+        symbolic_shapes = self.symbolic_shapes
 
         def make_kernel_render(
             out_node,
@@ -690,6 +908,7 @@ class NVUniversalGemmCaller(ChoiceCaller):
                 bias_node=bias_node,
                 # pyrefly: ignore [bad-argument-type]
                 output_scale_node=output_scale_node,
+                symbolic_shapes=symbolic_shapes,
             )
 
             def render():
@@ -1036,6 +1255,8 @@ def _add_nv_gemm_choices_impl(
                 bias_node=bias_node,
                 output_scale_node=output_scale_node,
             )
+            if not caller._supports_current_shape_constraints():
+                continue
             choices.append(caller)
             num_added += 1
         except Exception:

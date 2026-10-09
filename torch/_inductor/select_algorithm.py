@@ -4957,6 +4957,11 @@ class AlgorithmSelectorCache(PersistentCache):
             if NVUniversalGemmCaller is not None
             and isinstance(c, NVUniversalGemmCaller)
         )
+        if nvgemm_count:
+            from cutlass.operators.config import GlobalOptions
+
+            if not GlobalOptions().use_tvm_ffi:
+                nvgemm_count = 0
         # Block for pool warmup when there are enough NVGEMM choices to justify
         # it: the serial fallback (lazy compile at benchmark time) is ~15x
         # slower, and the non-blocking use_process_pool() check can otherwise
@@ -5014,6 +5019,7 @@ class AlgorithmSelectorCache(PersistentCache):
                             has_output_scale=c.bmreq.has_output_scale,
                             swap_ab=c.bmreq.swap_ab,
                             metadata=c.bmreq.kernel.metadata,
+                            symbolic_shapes=c.bmreq.symbolic_shapes,
                         )
                     except (BrokenProcessPool, RuntimeError) as e:
                         # A precompile worker crashed and closed the pool. Stop
