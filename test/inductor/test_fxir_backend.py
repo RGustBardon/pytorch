@@ -934,7 +934,7 @@ class AOTFxirTestCase(InductorTestCase):
     device = GPU_TYPE
 
     def check(
-        self, model, inp, dynamic_shapes=None, strict=False
+        self, model, inp, dynamic_shapes=None, strict=False, check_fn=same
     ) -> torch.fx.GraphModule:
         with torch.no_grad():
             ep = torch.export.export(
@@ -945,7 +945,7 @@ class AOTFxirTestCase(InductorTestCase):
             )
             # Flatten args for fx_wrapper gm
             flat_args, _ = pytree.tree_flatten(inp)
-            self.assertTrue(same(model(*inp), gm(*flat_args)))
+            self.assertTrue(check_fn(model(*inp), gm(*flat_args)))
 
             for node in gm.graph.nodes:
                 if (
@@ -963,6 +963,39 @@ class AOTFxirTestCase(InductorTestCase):
 
         inp = (torch.ones(3, device=self.device), torch.ones(3, device=self.device))
         self.check(M(), inp)
+
+    @parametrize(
+        "input_dtype,dtype",
+        (
+            (torch.uint8, torch.float8_e4m3fn),
+            (torch.float16, torch.bfloat16),
+            (torch.uint8, torch.uint8),
+        ),
+    )
+    @parametrize("offset", (0, 16))
+    def test_reinterpret_dtype_view(self, input_dtype, dtype, offset):
+        class M(torch.nn.Module):
+            def forward(self, x):
+                return x.view(dtype)[offset : offset + 32].reshape(2, 16)
+
+        x = torch.arange(64, dtype=input_dtype)
+        model = M()
+        gm = self.check(
+            model, (x,), check_fn=lambda ref, res: same(ref.float(), res.float())
+        )
+        result = gm(x)
+        expected = model(x)
+
+        self.assertEqual(result.dtype, expected.dtype)
+        self.assertEqual(result.shape, expected.shape)
+        self.assertEqual(result.stride(), expected.stride())
+        self.assertEqual(result.storage_offset(), expected.storage_offset())
+        self.assertEqual(result.view(torch.uint8), expected.view(torch.uint8))
+        self.assertEqual(
+            result.untyped_storage().data_ptr(), x.untyped_storage().data_ptr()
+        )
+        (output,) = gm.graph.find_nodes(op="output")
+        self.assertEqual(output.args[0].meta["val"].dtype, dtype)
 
     @requires_gpu()
     def test_aoti_fx_parallel_compile_reloads_triton_kernel(self):
