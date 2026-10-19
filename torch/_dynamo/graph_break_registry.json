@@ -72,6 +72,16 @@
       ]
     }
   ],
+  "GB6032": [
+    {
+      "Gb_type": "non-constant key in instance __dict__",
+      "Context": "key: {key.vt}",
+      "Explanation": "Dynamo models object instance __dict__ keys as constants.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
+    }
+  ],
   "GB2861": [
     {
       "Gb_type": "Untraceable C tp_hash",
@@ -297,6 +307,26 @@
       "Context": "",
       "Explanation": "We cannot reconstruct a torch.autograd.Function's context object.",
       "Hints": []
+    }
+  ],
+  "GB7693": [
+    {
+      "Gb_type": "non-string key on unsupported instance __dict__ owner",
+      "Context": "object type: {type(item).__name__}, key: {name}",
+      "Explanation": "Dynamo cannot replay a non-string instance __dict__ key for this object type.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
+    }
+  ],
+  "GB4765": [
+    {
+      "Gb_type": "non-string key on pre-existing instance __dict__",
+      "Context": "object type: {type(item).__name__}, key: {name}",
+      "Explanation": "Dynamo cannot replay a non-string instance __dict__ key for an object that existed before tracing.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
     }
   ],
   "GB0020": [
@@ -2439,6 +2469,46 @@
       "Hints": [
         "Remove the custom `vjp` method if possible.",
         "Use standard `backward` instead if applicable.",
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
+    }
+  ],
+  "GB4085": [
+    {
+      "Gb_type": "setattr() on a pre-existing OrderedDict",
+      "Context": "setattr({self.debug_repr()}, {name_var}, {value})",
+      "Explanation": "Dynamo models instance attributes of an OrderedDict only when the object is built inside the traced region; writing an attribute of a pre-existing OrderedDict is not modeled.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
+    }
+  ],
+  "GB6048": [
+    {
+      "Gb_type": "non-constant attribute name in OrderedDict.__setattr__",
+      "Context": "setattr({self.debug_repr()}, {name_var}, {value})",
+      "Explanation": "Dynamo requires the attribute name to be a constant.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
+    }
+  ],
+  "GB4118": [
+    {
+      "Gb_type": "setattr() of a descriptor attribute on OrderedDict",
+      "Context": "setattr({self.debug_repr()}, {name}, {value})",
+      "Explanation": "Dynamo does not model writes to attributes that are data descriptors on the OrderedDict type (e.g. __class__/__dict__).",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
+    }
+  ],
+  "GB6779": [
+    {
+      "Gb_type": "__dict__ access on a pre-existing OrderedDict",
+      "Context": "getattr({self.debug_repr()}, '__dict__')",
+      "Explanation": "Dynamo only models the instance __dict__ of OrderedDicts built inside the traced region.",
+      "Hints": [
         "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
       ]
     }

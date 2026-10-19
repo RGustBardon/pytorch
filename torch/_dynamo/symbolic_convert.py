@@ -3527,6 +3527,11 @@ class InstructionTranslatorBase(
         except Unsupported:
             if not obj.is_python_constant():
                 raise
+            # as_python_constant() rebuilds a fresh OrderedDict from the tracked
+            # items, dropping its instance __dict__, so an eager getattr could
+            # return a wrong value or a spurious error.
+            if isinstance(obj, variables.OrderedDictVariable):
+                raise
             # An eager getattr would run a user-defined __get__ at trace time
             # and bake its result into the graph.
             if isinstance(obj, variables.UserDefinedClassVariable) and isinstance(

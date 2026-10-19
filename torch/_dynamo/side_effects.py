@@ -57,6 +57,7 @@ from .utils import (
     is_frozen_dataclass,
     is_namedtuple_cls,
     is_pybind11_enum_member,
+    istype,
     nn_module_new,
     object_new,
 )
@@ -581,8 +582,31 @@ class SideEffects:
                 self.mutated_sources.add(AttrSource(item_source, name))
 
     def store_instance_dict_attr(
-        self, item: VariableTracker, name: str, value: VariableTracker
+        self, item: VariableTracker, name: Any, value: VariableTracker
     ) -> None:
+        if not isinstance(name, str) and not isinstance(
+            item,
+            (variables.UserDefinedObjectVariable, variables.OrderedDictVariable),
+        ):
+            # Other owners replay INSTANCE_DICT writes as STORE_ATTR, which
+            # requires a str name in co_names.
+            unimplemented(
+                gb_type="non-string key on unsupported instance __dict__ owner",
+                context=f"object type: {type(item).__name__}, key: {name!r}",
+                explanation="Dynamo cannot replay a non-string instance __dict__ "
+                "key for this object type.",
+                hints=[*graph_break_hints.SUPPORTABLE],
+            )
+        if not isinstance(name, str) and item.source is not None:
+            # Sourced owners materialize the mutation through AttrSource, whose
+            # member must be a str; the mapping-API key cannot be represented.
+            unimplemented(
+                gb_type="non-string key on pre-existing instance __dict__",
+                context=f"object type: {type(item).__name__}, key: {name!r}",
+                explanation="Dynamo cannot replay a non-string instance __dict__ "
+                "key for an object that existed before tracing.",
+                hints=[*graph_break_hints.SUPPORTABLE],
+            )
         # `obj.__dict__` ordering is observable (e.g. list(obj.__dict__)). When a
         # key is re-added after being deleted, CPython appends it at the end
         # rather than reusing its old slot. store_attr_mutations is an
@@ -790,15 +814,34 @@ class SideEffects:
             mutation_type_cls=mutation_type_cls,
         )
 
+    def ensure_attribute_mutation(self, variable: VariableTracker) -> None:
+        """Register *variable* for attribute-mutation replay, keyed by its id.
+
+        A VT can carry an ``AttributeMutation`` mutation_type yet be absent from
+        ``id_to_variable``: a speculative subgraph (e.g. a HigherOrderOp body)
+        may register it in a side-effects snapshot that is later discarded, while
+        the mutation_type on the VT object survives. Registration must therefore
+        be keyed by id, not inferred from the mutation_type.
+        """
+        if id(variable) in self.id_to_variable:
+            return
+        if not isinstance(variable.mutation_type, AttributeMutation):
+            previous = variable.mutation_type
+            mutation = AttributeMutationNew()
+            if previous is not None:
+                # Keep the object's creation scope: the mutation may be observed
+                # inside a HigherOrderOp even though the object predates it, and
+                # is_side_effect_safe() relies on the creation scope.
+                mutation.scope = previous.scope
+            variable.mutation_type = mutation
+        self.id_to_variable[id(variable)] = variable
+        self.keepalive.append(variable)
+
     def track_attribute_mutation_new(self, variable: VariableTracker) -> None:
         """Register a sourceless VT (e.g. a synthetic exception) as a new
         attribute-mutation object so its attribute mutations are codegen'd.
         Keyed by the VT's id since there is no backing Python object."""
-        if id(variable) in self.id_to_variable:
-            return
-        variable.mutation_type = AttributeMutationNew()
-        self.id_to_variable[id(variable)] = variable
-        self.keepalive.append(variable)
+        self.ensure_attribute_mutation(variable)
 
     def track_object_new(
         self,
@@ -1041,6 +1084,15 @@ class SideEffects:
             if var in visited:
                 return
             visited.add(var)
+            # A DunderDictVariable views its owner's instance __dict__ through
+            # this table, so the owner (and, transitively, its contents) has to
+            # stay alive for its attribute mutations to be codegen'd. Exact type
+            # check: isinstance() on a LazyVariableTracker would realize it
+            # during pruning.
+            if istype(var, variables.DunderDictVariable):
+                # The proxy storage is not walked by VariableTracker.visit, so
+                # walk the owner explicitly to keep its contents reconstructable.
+                VariableTracker.visit(visit, var.items.item)  # noqa: F821
             # Object may have been mutated, store this mutation.
             if isinstance(var.mutation_type, AttributeMutationNew):
                 live_new_objects.add(var)
@@ -1166,7 +1218,31 @@ class SideEffects:
         # Since newly constructed objects don't have a source, we manually
         # codegen their construction and store them to a newly assigned local
         # source. Note that `ValueMutationNew` isn't tracked by SideEffects.
-        for var in self._get_modified_vars():
+        modified_vars = self._get_modified_vars()
+
+        # Sourceless OrderedDicts with modeled instance attributes are rebuilt in
+        # two phases: materialize every empty container and cache it into its temp
+        # local first, then fill in contents. A single-phase reconstruct either
+        # inlines a fresh copy of a not-yet-cached child (breaking aliasing) or,
+        # on the second PyCodegen pass, follows a stale TempLocalSource from the
+        # first pass and loads an uninitialized local (invalid bytecode ->
+        # SIGSEGV).
+        attributed_ordered_dicts = [
+            var
+            for var in modified_vars
+            if isinstance(var.mutation_type, AttributeMutationNew)
+            and isinstance(var, variables.OrderedDictVariable)
+            and not isinstance(var, variables.UserDefinedObjectVariable)
+        ]
+        for var in attributed_ordered_dicts:
+            var.reconstruct_empty(cg)
+            cg.add_cache(var)
+            var.source = TempLocalSource(cg.tempvars[var])
+        attributed_ordered_dict_set = set(attributed_ordered_dicts)
+
+        for var in modified_vars:
+            if var in attributed_ordered_dict_set:
+                continue
             if not isinstance(var.mutation_type, AttributeMutationNew):
                 if var.source is None:
                     raise AssertionError(
@@ -1324,6 +1400,18 @@ class SideEffects:
                         cg.extend_output(
                             [*create_call_method(3), create_instruction("POP_TOP")]
                         )
+
+        # Fill in contents only after every other modified var has a temp local,
+        # so contents may reference objects that were tracked after the
+        # OrderedDict without hitting "reconstruction failure" or duplicating
+        # them.
+        for var in attributed_ordered_dicts:
+            if not var.items:
+                continue
+            cg(var)
+            cg.load_method("update")
+            var.reconstruct_kvs_into_new_dict(cg)
+            cg.extend_output([*create_call_method(1), create_instruction("POP_TOP")])
 
         for ctx, args in self.save_for_backward:
             cg(ctx.source)
@@ -1671,6 +1759,13 @@ def _codegen_deque_mutation(ctx: SideEffectReplayContext) -> None:
             # contents, so it needs the composite handler.
             variables.DefaultDictVariable,
         ),
+    )
+    # A sourceless OrderedDict with a modeled instance __dict__ is rebuilt with
+    # all of its items by codegen_save_tempvars; only its attribute stores are
+    # left to replay (by the composite attribute handler).
+    and not (
+        isinstance(ctx.var, variables.OrderedDictVariable)
+        and ctx.side_effects.is_attribute_mutation(ctx.var)
     ),
     priority=70,
 )
@@ -2064,7 +2159,7 @@ def _codegen_attribute_mutation(ctx: SideEffectReplayContext) -> None:
                         )
                     )
                     cg(var.source)  # type: ignore[attr-defined]
-                    cg(variables.ConstantVariable(name))
+                    cg(variables.ConstantVariable.create(name))
                     ctx.suffixes.append(
                         [
                             *create_call_function(2, False),
@@ -2082,17 +2177,19 @@ def _codegen_attribute_mutation(ctx: SideEffectReplayContext) -> None:
                 cg(var.source)
                 ctx.suffixes.append([create_instruction("DELETE_ATTR", argval=name)])
                 side_effect_occurred = True
-        elif (
-            isinstance(var, variables.UserDefinedObjectVariable)
-            and mutation_kind is AttrMutationKind.INSTANCE_DICT
+        elif mutation_kind is AttrMutationKind.INSTANCE_DICT and isinstance(
+            var, (variables.UserDefinedObjectVariable, variables.OrderedDictVariable)
         ):
+            # Direct instance __dict__ write: avoids STORE_ATTR's co_names
+            # requirement so non-str keys (legal for the __dict__ mapping API)
+            # can be replayed too.
             cg.add_push_null(
                 lambda: cg.load_import_from(
                     utils.__name__, "object_setattr_ignore_descriptor"
                 )
             )
             cg(var.source)  # type: ignore[attr-defined]
-            cg(variables.ConstantVariable(name))
+            cg(variables.ConstantVariable.create(name))
             cg(value)
             ctx.suffixes.append(
                 [

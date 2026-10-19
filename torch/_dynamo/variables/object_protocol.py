@@ -2494,7 +2494,11 @@ def generic_getattr(
 
     # Side effects: check for pending attribute mutations.
     if tx.output.side_effects.has_pending_mutation_of_attr(obj, name):
-        if not isinstance(obj, variables.UserDefinedObjectVariable):
+        if isinstance(obj, variables.OrderedDictVariable):
+            # Resolved by OrderedDictVariable.tp_getattro_impl, which applies
+            # CPython's data-descriptor / instance-dict precedence.
+            pass
+        elif not isinstance(obj, variables.UserDefinedObjectVariable):
             value = tx.output.side_effects.load_attr(obj, name)
             # A pending store of a descriptor onto a class lands in cls.__dict__,
             # so reading it back has to run tp_descr_get the way type_getattro
@@ -2505,7 +2509,9 @@ def generic_getattr(
             ):
                 return value.tp_descr_get_impl(tx, obj, obj)
             return value
-        if tx.output.side_effects.has_pending_mutation_of_attr(
+        if isinstance(
+            obj, variables.UserDefinedObjectVariable
+        ) and tx.output.side_effects.has_pending_mutation_of_attr(
             obj, name, AttrMutationKind.INSTANCE_DICT
         ):
             value = tx.output.side_effects.load_attr(obj, name, deleted_ok=True)
