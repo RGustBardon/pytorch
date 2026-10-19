@@ -494,13 +494,26 @@ void initDynamoBindings(PyObject* torch) {
           "isolate_recompiles_id", &CacheEntry::_isolate_recompiles_id)
       .def(
           "update_diff_guard_root_manager",
-          &CacheEntry::update_diff_guard_root_manager);
+          &CacheEntry::update_diff_guard_root_manager)
+      // Python is handed copies, so compare the entries they were taken from.
+      // compile_id rules out a later entry reusing a freed one's address.
+      .def("__eq__", &CacheEntry::py_equal, py::is_operator())
+      .def("__hash__", &CacheEntry::py_hash);
 
   py::class_<PrecompileEntry>(m, "_PrecompileEntry")
       .def_readonly("guard_manager", &PrecompileEntry::guard_manager);
 
   py::class_<ExtraState>(m, "_ExtraState")
-      .def("invalidate", &ExtraState::invalidate);
+      .def(
+          "invalidate",
+          [](ExtraState& self,
+             CacheEntry* cache_entry,
+             py::object deleted_guard_manager) {
+            TORCH_CHECK(
+                cache_entry != nullptr && cache_entry->_owner == &self,
+                "cache entry does not belong to this ExtraState");
+            self.invalidate(cache_entry, std::move(deleted_guard_manager));
+          });
 
   py::enum_<FrameAction>(m, "_FrameAction")
       .value("DEFAULT", FrameAction::DEFAULT)
