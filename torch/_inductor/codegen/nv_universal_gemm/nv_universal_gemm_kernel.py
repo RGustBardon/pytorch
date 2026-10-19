@@ -14,6 +14,7 @@ import functools
 import hashlib
 import importlib
 import logging
+import math
 import re
 import threading
 from collections import OrderedDict
@@ -69,7 +70,7 @@ _NVGEMM_BIAS_ADD_EPILOGUE_FINGERPRINT = hashlib.sha256(
     _NVGEMM_BIAS_ADD_EPILOGUE_SOURCE.encode()
 ).hexdigest()
 _REUSE_INIT_LOCK = threading.Lock()
-_MAX_REUSE_ARGUMENT_LAYOUTS = 1
+_MAX_REUSE_ARGUMENT_LAYOUTS = 8
 
 
 def _local_reduce_source_constant(field: str) -> str:
@@ -109,6 +110,82 @@ def _normalize_epilogue_input_tensor(value: Any, permute=None) -> Any:
     return value
 
 
+def _alignment_divisibility(alignment, width):
+    return max(alignment * 8 // width, 1)
+
+
+def _epilogue_layout_contract(shape, stride, width, alignment):
+    major = next(
+        (
+            dim
+            for dim, (extent, step) in enumerate(zip(shape, stride, strict=True))
+            if extent > 1 and step == 1
+        ),
+        len(shape) - 1 if all(extent == 1 for extent in shape) else None,
+    )
+    if major is None:
+        raise ValueError(
+            f"Epilogue tensor has no contiguous mode: shape={shape}, stride={stride}"
+        )
+    max_divisibility = _alignment_divisibility(alignment, width)
+    divisibility = tuple(
+        1 if dim == major or shape[dim] == 1 else math.gcd(step, max_divisibility)
+        for dim, step in enumerate(stride)
+    )
+    return major, divisibility
+
+
+def _epilogue_tensor_alignment(tensor, max_alignment: int = 16):
+    from torch._subclasses.fake_tensor import is_fake_tensor
+
+    address = (
+        tensor.storage_offset() * tensor.element_size()
+        if is_fake_tensor(tensor)
+        else tensor.data_ptr()
+    )
+    return math.gcd(address, max_alignment)
+
+
+def _mark_epilogue_tensor_dynamic(
+    wrapper, alignment_bytes: int | None = None, runtime_tensor=None
+):
+    import cutlass.cute as cute
+    from cutlass.operators.config import GlobalOptions
+
+    if alignment_bytes is None:
+        alignment_bytes = math.gcd(wrapper._data_ptr, 16)
+    if wrapper.dtype.width < 8:
+        return wrapper
+    major, divisibility = _epilogue_layout_contract(
+        wrapper.shape, wrapper.stride, wrapper.dtype.width, alignment_bytes
+    )
+
+    use_tvm_ffi = GlobalOptions().use_tvm_ffi
+    # Native DLPack descriptors have 32-bit shapes and 64-bit strides, with
+    # dynamic unit dimensions. The fake tensor must match that runtime ABI.
+    symbolic_extent = cute.sym_int64 if use_tvm_ffi else cute.sym_int32
+    shape = tuple(
+        1 if extent == 1 and use_tvm_ffi else symbolic_extent()
+        for extent in wrapper.shape
+    )
+    stride = tuple(
+        1 if dim == major else cute.sym_int64(divisibility=divisibility[dim])
+        for dim in range(len(wrapper.shape))
+    )
+    wrapper.compile_time_tensor = cute.runtime.make_fake_tensor(
+        wrapper.dtype,
+        shape,
+        stride,
+        assumed_align=alignment_bytes,
+        memspace=cute.AddressSpace.gmem if use_tvm_ffi else cute.AddressSpace.generic,
+    )
+    if not use_tvm_ffi and runtime_tensor is not None:
+        wrapper._runtime_tensor = cute.runtime.from_dlpack(
+            _nvgemm_binding_tensor(runtime_tensor), assumed_align=alignment_bytes
+        ).mark_layout_dynamic(major)
+    return wrapper
+
+
 def _transpose_local_reduce_tensors(
     reduction: GemmReductionArguments,
 ) -> GemmReductionArguments:
@@ -136,6 +213,35 @@ def _epilogue_readonly_input_names(epilogue) -> tuple[str, ...]:
     else:
         inputs, outputs = _cutedsl_epilogue_io(source)
     return tuple(name for name in inputs if name not in outputs)
+
+
+def _normalize_epilogue_inputs(epilogue, *, scalar_inputs: bool | None = None) -> None:
+    import torch
+
+    for name in _epilogue_readonly_input_names(epilogue):
+        value = epilogue.tensors.get(name)
+        if isinstance(value, torch.Tensor) and (
+            scalar_inputs is None or (value.ndim == 0) == scalar_inputs
+        ):
+            epilogue.tensors[name] = _normalize_epilogue_input_tensor(value)
+
+
+def _epilogue_scalar_reduction_destinations(epilogue):
+    destinations = getattr(epilogue, "_scalar_reduction_destinations", None)
+    return destinations() if destinations is not None else ()
+
+
+def _mark_epilogue_tensors_dynamic(
+    epilogue, alignments: dict[str, int] | None = None, runtime_tensors=None
+) -> None:
+    from cutlass.operators.utils.tensor import TensorWrapper
+
+    static_names = _epilogue_scalar_reduction_destinations(epilogue)
+    for name, value in epilogue.tensors.items():
+        if isinstance(value, TensorWrapper) and name not in static_names:
+            alignment = alignments.get(name) if alignments is not None else None
+            tensor = runtime_tensors.get(name) if runtime_tensors is not None else None
+            _mark_epilogue_tensor_dynamic(value, alignment, tensor)
 
 
 class CuTeDSLEpilogueArguments:
@@ -200,6 +306,7 @@ class CuTeDSLEpilogueArguments:
         return None
 
     def to_tensor_wrappers(self, permute: list[int] | None = None) -> None:
+        from cutlass.operators.config import GlobalOptions
         from cutlass.operators.utils.tensor import TensorWrapper
 
         import torch
@@ -211,7 +318,11 @@ class CuTeDSLEpilogueArguments:
             elif isinstance(value, torch.Tensor) and permute is not None:
                 value = value.permute(permute)
             if isinstance(value, torch.Tensor):
-                self.tensors[name] = TensorWrapper(_nvgemm_binding_tensor(value))
+                self.tensors[name] = TensorWrapper(
+                    _nvgemm_binding_tensor(value),
+                    alignment_bytes=_epilogue_tensor_alignment(value),
+                    static_layout=not GlobalOptions().use_tvm_ffi,
+                )
 
 
 @functools.cache
@@ -286,6 +397,7 @@ def _compile_nvgemm(
     prefetch_mode: str | None = None,
     use_pdl: bool | None = None,
     kernel_output_dtype: torch.dtype | str | None = None,
+    symbolic_shapes: bool = False,
 ):
     """Compile an NVGEMM artifact, trying a fallback (disk cache) first.
 
@@ -312,6 +424,7 @@ def _compile_nvgemm(
         accumulator_type,
         output_scale=output_scale,
         epilogue=epilogue_args,
+        symbolic_shapes=symbolic_shapes,
         **(args_kwargs or {}),
     )
     if kernel_obj is not None:
@@ -327,7 +440,9 @@ def _compile_nvgemm(
             prefetch_mode=prefetch_mode,
             use_pdl=use_pdl,
             kernel_output_dtype=kernel_output_dtype,
-            epilogue_specialization=_local_reduce_specialization(args_kwargs),
+            epilogue_specialization=_local_reduce_specialization(
+                args_kwargs, symbolic_shapes=symbolic_shapes
+            ),
         )
 
     artifact = None
@@ -531,6 +646,7 @@ def _worker_nvgemm_autotuning_precompile(
         has_epilogue=has_bias_epilogue,
         aux_tensors=aux_tensors,
         epilogue_source=epilogue_source,
+        epilogue_args=epilogue_args,
         logical_m=logical_m,
         symbolic_shapes=symbolic_shapes,
     )
@@ -590,6 +706,7 @@ def _worker_nvgemm_autotuning_precompile(
             base_kernel=base_kernel,
             prefetch_mode=prefetch_mode,
             use_pdl=use_pdl,
+            symbolic_shapes=symbolic_shapes,
         )
 
         if was_compiled:
@@ -643,16 +760,23 @@ def _create_gemm_arguments(
     epilogue: Any | None = None,
     local_reduce: GemmReductionArguments | None = None,
     logical_m: Any | None = None,
+    symbolic_shapes: bool = False,
 ):
     import cutlass.operators
 
-    input_tensors = tuple(_nvgemm_binding_tensor(t) for t in input_tensors)
+    import torch
+
+    input_tensors = tuple(_nvgemm_binding_tensor(tensor) for tensor in input_tensors)
     out = _nvgemm_binding_tensor(out)
-    if epilogue is not None:
-        epilogue.tensors = OrderedDict(
-            (name, _nvgemm_binding_tensor(value))
+
+    epilogue_alignments = {}
+    if epilogue is not None and symbolic_shapes:
+        input_names = _epilogue_readonly_input_names(epilogue)
+        epilogue_alignments = {
+            name: 16 if name in input_names else _epilogue_tensor_alignment(value)
             for name, value in epilogue.tensors.items()
-        )
+            if isinstance(value, torch.Tensor)
+        }
 
     local_reduce = local_reduce or GemmReductionArguments()
     has_local_reduce = local_reduce.enabled
@@ -669,7 +793,34 @@ def _create_gemm_arguments(
         from cutlass.operators.utils.tensor import TensorWrapper
 
         def wrap(output):
-            return TensorWrapper(_nvgemm_binding_tensor(output), alignment_bytes=4)
+            import cutlass.cute as cute
+            from cutlass.operators.config import GlobalOptions
+            from cutlass.operators.utils.tensor import get_stride_rank
+
+            alignment = _epilogue_tensor_alignment(output, 4)
+            binding = _nvgemm_binding_tensor(output)
+            wrapper = TensorWrapper(binding, alignment_bytes=alignment)
+            if symbolic_shapes:
+                major, _ = _epilogue_layout_contract(
+                    wrapper.shape, wrapper.stride, wrapper.dtype.width, alignment
+                )
+                divisibility = _alignment_divisibility(alignment, wrapper.dtype.width)
+                shape = tuple(
+                    cute.sym_int32(divisibility=divisibility if dim == major else 1)
+                    for dim in range(len(wrapper.shape))
+                )
+                wrapper.compile_time_tensor = cute.runtime.make_fake_compact_tensor(
+                    wrapper.dtype,
+                    shape,
+                    stride_order=get_stride_rank(wrapper.stride),
+                    assumed_align=alignment,
+                    memspace=(
+                        cute.AddressSpace.gmem
+                        if GlobalOptions().use_tvm_ffi
+                        else cute.AddressSpace.generic
+                    ),
+                )
+            return wrapper
 
         args.local_reduce = local_reduce.map_tensors(wrap)
         if output_scale is not None:
@@ -687,6 +838,13 @@ def _create_gemm_arguments(
         raise NotImplementedError(
             "Epilogue fusion is not yet supported for grouped GEMM"
         )
+    direct_epilogue = epilogue is not None and isinstance(
+        epilogue.epilogue_fn, CuTeDSLEpilogueSource
+    )
+    epilogue_values = {}
+    if epilogue is not None and direct_epilogue:
+        _normalize_epilogue_inputs(epilogue)
+        epilogue_values = dict(epilogue.tensors)
 
     match variant_name:
         case "GROUPED_GEMM":
@@ -703,8 +861,8 @@ def _create_gemm_arguments(
             from cutlass.operators.arguments import ScaledOperand
 
             a, b, scale_a, scale_b = input_tensors
-            a = ScaledOperand(a, scale_a, scale_mode_a, swizzle_mode_a)
-            b = ScaledOperand(b, scale_b, scale_mode_b, swizzle_mode_b)
+            a = ScaledOperand(a, scale_a.view(-1), scale_mode_a, swizzle_mode_a)
+            b = ScaledOperand(b, scale_b.view(-1), scale_mode_b, swizzle_mode_b)
 
         case "GEMM":
             a, b = input_tensors
@@ -713,11 +871,50 @@ def _create_gemm_arguments(
             raise NotImplementedError(f"Unsupported NVGEMM variant: {variant_name}")
 
     kwargs: dict[str, Any] = {"accumulator_type": accumulator_type}
-    if epilogue is not None:
+    if direct_epilogue:
         kwargs["epilogue"] = epilogue
-    return with_local_reduce(
+    args = with_local_reduce(
         cutlass.operators.arguments.GemmArguments(a, b, out, **kwargs)
     )
+
+    if epilogue is not None and not direct_epilogue:
+        problem = args.problem_size
+        scalar_inputs = {
+            name: value
+            for name in _epilogue_readonly_input_names(epilogue)
+            if isinstance(value := epilogue.tensors.get(name), torch.Tensor)
+            and value.ndim == 0
+        }
+        _normalize_epilogue_inputs(epilogue, scalar_inputs=False)
+        epilogue.trace((problem.L, problem.M, problem.N), args.accumulator_type)
+        for name, scalar in scalar_inputs.items():
+            epilogue.tensors[name] = _normalize_epilogue_input_tensor(scalar)
+        tensor_values = dict(epilogue.tensors)
+        epilogue_values = tensor_values
+        from cutlass.operators.config import GlobalOptions
+        from cutlass.operators.utils.tensor import TensorWrapper
+
+        static_names = _epilogue_scalar_reduction_destinations(epilogue)
+        epilogue.tensors = OrderedDict(
+            (
+                name,
+                TensorWrapper(
+                    _nvgemm_binding_tensor(value),
+                    alignment_bytes=_epilogue_tensor_alignment(value),
+                    static_layout=not GlobalOptions().use_tvm_ffi
+                    or name in static_names,
+                )
+                if isinstance(value, torch.Tensor)
+                else value,
+            )
+            for name, value in tensor_values.items()
+        )
+        args.epilogue = epilogue
+    if epilogue is not None and symbolic_shapes:
+        _mark_epilogue_tensors_dynamic(
+            args.epilogue, epilogue_alignments, epilogue_values
+        )
+    return args
 
 
 def _lookup_gemm_kernel(
@@ -801,14 +998,72 @@ def _symbolic_tensor_sig(t):
     return (t.dtype, t.ndim, stride_rank, "compact", 16, 16 // t.element_size())
 
 
-def _local_reduce_specialization(variant_kwargs: dict | None) -> tuple:
+def _symbolic_local_reduce_tensor_sig(t):
+    alignment = _epilogue_tensor_alignment(t, 4)
+    shape, stride = tuple(t.shape), t.stride()
+    major, divisibility = _epilogue_layout_contract(
+        shape, stride, t.element_size() * 8, alignment
+    )
+    order = tuple(sorted(range(len(stride)), key=lambda dim: (stride[dim], dim)))
+    units = tuple(size == 1 for size in shape)
+    return (t.dtype, t.ndim, order, units, major, alignment, divisibility)
+
+
+def _symbolic_epilogue_sig(epilogue_args):
+    from cutlass.operators.utils import dtype as dtype_utils
+
+    import torch
+    from torch._prims_common import make_contiguous_strides_for
+
+    if epilogue_args is None:
+        return ()
+    input_names = OrderedSet(_epilogue_readonly_input_names(epilogue_args))
+    signature: list[tuple[Any, ...]] = []
+    for name, value in epilogue_args.tensors.items():
+        if not isinstance(value, torch.Tensor):
+            signature.append((name, type(value)))
+            continue
+        shape = tuple(value.shape)
+        stride = value.stride()
+        alignment = _epilogue_tensor_alignment(value)
+        if name in input_names:
+            if not shape:
+                shape = (8, 1)
+            stride = make_contiguous_strides_for(shape)
+            alignment = 16
+        if dtype_utils.cutlass_type_from_torch_type(value.dtype).width < 8:
+            signature.append((name, shape, tuple(stride), value.dtype))
+            continue
+        major, divisibility = _epilogue_layout_contract(
+            shape,
+            stride,
+            dtype_utils.cutlass_type_from_torch_type(value.dtype).width,
+            alignment,
+        )
+        signature.append(
+            (
+                name,
+                value.dtype,
+                tuple(extent == 1 for extent in shape),
+                major,
+                alignment,
+                divisibility,
+            )
+        )
+    return tuple(signature)
+
+
+def _local_reduce_specialization(
+    variant_kwargs: dict | None, *, symbolic_shapes: bool = False
+) -> tuple:
     if variant_kwargs is None or not (reduction := variant_kwargs.get("local_reduce")):
         return ()
     specialization = tuple(reduction.specialization_items())
+    tensor_sig = _symbolic_local_reduce_tensor_sig if symbolic_shapes else _tensor_sig
     tensor_specialization = tuple(
         (
             field,
-            None if tensor is None else _tensor_sig(tensor),
+            None if tensor is None else tensor_sig(tensor),
         )
         for field, tensor in reduction.tensor_items()
     )
@@ -823,10 +1078,10 @@ def _create_gemm_cache_key(
     aux_tensors: tuple = (),
     epilogue_source: str = "",
     epilogue_specialization: tuple = (),
+    epilogue_args=None,
     logical_m: Any | None = None,
     symbolic_shapes: bool = False,
 ):
-    symbolic_shapes = symbolic_shapes and not has_epilogue
     cache_key = (
         tuple(_symbolic_tensor_sig(t) for t in (*input_tensors, out))
         if symbolic_shapes
@@ -838,7 +1093,19 @@ def _create_gemm_cache_key(
         cache_key = (*cache_key, "logical_m", logical_m)
 
     if has_epilogue:
-        aux_sig = tuple(_tensor_sig(t) for t in aux_tensors)
+        if symbolic_shapes:
+            aux_sig = _symbolic_epilogue_sig(epilogue_args)
+        elif epilogue_args is not None:
+            import torch
+
+            aux_sig = tuple(
+                (name, _tensor_sig(value), _epilogue_tensor_alignment(value))
+                if isinstance(value, torch.Tensor)
+                else (name, type(value))
+                for name, value in epilogue_args.tensors.items()
+            )
+        else:
+            aux_sig = tuple(_tensor_sig(t) for t in aux_tensors)
         return (
             *cache_key,
             "epilogue",
@@ -846,6 +1113,8 @@ def _create_gemm_cache_key(
             aux_sig,
             epilogue_specialization,
         )
+    if epilogue_specialization:
+        return (*cache_key, "local_reduce", epilogue_specialization)
     return cache_key
 
 
@@ -951,6 +1220,8 @@ def _update_reuse_args_tensors(
         return False
 
     if variant_name == "SCALED_GEMM":
+        a, b, scale_a, scale_b = input_tensors
+        input_tensors = (a, b, scale_a.view(-1), scale_b.view(-1))
         wrappers = (
             args.A.quantized.tensor,
             args.B.quantized.tensor,
@@ -969,11 +1240,7 @@ def _update_reuse_args_tensors(
     epilogue = getattr(args, "epilogue", None)
     if epilogue is not None:
         input_names = _epilogue_readonly_input_names(epilogue)
-        static_names = (
-            epilogue._scalar_reduction_destinations()
-            if hasattr(epilogue, "_scalar_reduction_destinations")
-            else ()
-        )
+        static_names = _epilogue_scalar_reduction_destinations(epilogue)
         for name, wrapper in epilogue.tensors.items():
             if not isinstance(wrapper, TensorWrapper):
                 continue
@@ -981,7 +1248,9 @@ def _update_reuse_args_tensors(
             runtime_tensor = getattr(val, "runtime_tensor", val)
             if name in input_names:
                 runtime_tensor = _normalize_epilogue_input_tensor(runtime_tensor)
-            layout_kind = "static" if name in static_names else "compact"
+            layout_kind = (
+                "dynamic" if symbolic_shapes and name not in static_names else "static"
+            )
             runtime_tensors.append((wrapper, runtime_tensor, layout_kind))
     runtime_reduce = args_kwargs.get("local_reduce") if args_kwargs else None
     for field, output in args.local_reduce.tensor_items():
@@ -989,7 +1258,9 @@ def _update_reuse_args_tensors(
             if runtime_reduce is None:
                 raise AssertionError("expected runtime local-reduction arguments")
             runtime_tensors.append((output, getattr(runtime_reduce, field), "compact"))
-    can_resize = symbolic_shapes and epilogue is None
+    can_resize = symbolic_shapes and (
+        epilogue is None or isinstance(epilogue, CuTeDSLEpilogueArguments)
+    )
     if variant_name == "GEMM":
         for wrapper, tensor, _ in runtime_tensors:
             shape, stride = tuple(tensor.shape), tensor.stride()
@@ -1019,11 +1290,12 @@ def _update_reuse_args_tensors(
                     raise ValueError("NVGEMM runtime tensor has no contiguous mode")
                 runtime = runtime.mark_layout_dynamic(major)
                 if layout_kind == "compact":
+                    divisibility = _alignment_divisibility(
+                        wrapper._alignment_bytes, wrapper.dtype.width
+                    )
                     runtime = runtime.mark_compact_shape_dynamic(
                         mode=major,
-                        divisibility=wrapper._alignment_bytes
-                        * 8
-                        // wrapper.dtype.width,
+                        divisibility=divisibility,
                         stride_order=get_stride_order(tensor.stride()),
                     )
             wrapper._runtime_tensor = runtime
@@ -1170,7 +1442,9 @@ def _nvgemm_run(
 
         stream = CUstream(stream)
 
-    epilogue_specialization = _local_reduce_specialization(variant_kwargs)
+    epilogue_specialization = _local_reduce_specialization(
+        variant_kwargs, symbolic_shapes=symbolic_shapes
+    )
     cache_key = _create_gemm_cache_key(
         input_tensors,
         out,
@@ -1178,12 +1452,24 @@ def _nvgemm_run(
         aux_tensors=aux_tensors,
         epilogue_source=epilogue_source,
         epilogue_specialization=epilogue_specialization,
+        epilogue_args=epilogue_args,
         logical_m=variant_kwargs["logical_m"],
         symbolic_shapes=symbolic_shapes,
     )
     dev_idx = input_tensors[0].device.index or 0
     mem_key = (cache_key, dev_idx, use_tvm_ffi)
     args_key = cache_key
+    if symbolic_shapes:
+        args_key = _create_gemm_cache_key(
+            input_tensors,
+            out,
+            has_epilogue=has_epilogue,
+            aux_tensors=aux_tensors,
+            epilogue_source=epilogue_source,
+            epilogue_specialization=_local_reduce_specialization(variant_kwargs),
+            epilogue_args=epilogue_args,
+            logical_m=variant_kwargs["logical_m"],
+        )
 
     artifact: Any = compiled_cache.get(mem_key)
     args = None
@@ -1224,6 +1510,7 @@ def _nvgemm_run(
             prefetch_mode=prefetch_mode,
             use_pdl=use_pdl,
             kernel_output_dtype=kernel_output_dtype,
+            symbolic_shapes=symbolic_shapes,
         )
 
         if was_compiled:
@@ -1247,6 +1534,7 @@ def _nvgemm_run(
                 accumulator_type,
                 output_scale=output_scale,
                 epilogue=epilogue_args,
+                symbolic_shapes=symbolic_shapes,
                 **variant_kwargs,
             )
         kernel.run(
@@ -1266,6 +1554,10 @@ def _nvgemm_run(
     args_cache, kernel, reuse_lock = artifact._nvgemm_reuse
     with reuse_lock:
         cached_args = args_cache.get(args_key)
+        cached_key = args_key
+        if cached_args is None and symbolic_shapes and args_cache:
+            cached_key = next(reversed(args_cache))
+            cached_args = args_cache[cached_key]
         if (
             args is None
             and cached_args is not None
@@ -1282,6 +1574,8 @@ def _nvgemm_run(
             )
         ):
             args = cached_args
+            if cached_key != args_key:
+                args_cache.pop(cached_key)
         elif args is None:
             args = _create_gemm_arguments(
                 variant_name,
@@ -1290,6 +1584,7 @@ def _nvgemm_run(
                 accumulator_type,
                 output_scale=output_scale,
                 epilogue=epilogue_args,
+                symbolic_shapes=symbolic_shapes,
                 **variant_kwargs,
             )
         args_cache[args_key] = args
@@ -1434,6 +1729,7 @@ def _nvgemm_precompile(
                 prefetch_mode=prefetch_mode,
                 use_pdl=use_pdl,
                 kernel_output_dtype=kernel_output_dtype,
+                symbolic_shapes=symbolic_shapes,
             )
             _nvgemm_disk_cache_set(
                 disk_fn_cache,
@@ -1806,11 +2102,21 @@ class NVUniversalGemmKernel(Kernel):
                     else f"out_ptr{output_buffers.index(reduce_name)}"
                 )
                 if reduce_name is not None:
+                    # The kernel expects both row and column group modes,
+                    # including the unit mode omitted by squeezed FX outputs.
                     logical_axis = (
                         1 - reduction.axis if self.swap_ab else reduction.axis
                     )
-                    squeeze_dim = -1 if logical_axis == 1 else -2
-                    reduce_ptr = f"{reduce_ptr}.squeeze({squeeze_dim})"
+                    a_name, b_name = input_tensor_names[:2]
+                    rows = f"{a_name}.shape[-2]"
+                    columns = f"{b_name}.shape[-1]"
+                    if logical_axis == 0:
+                        rows = f"({rows} // {reduction.group})"
+                    else:
+                        columns = f"({columns} // {reduction.group})"
+                    reduce_ptr = (
+                        f"{reduce_ptr}.view(*{a_name}.shape[:-2], {rows}, {columns})"
+                    )
 
                 def feed_output_ptr(output_name: str | None) -> str:
                     if output_name is None:

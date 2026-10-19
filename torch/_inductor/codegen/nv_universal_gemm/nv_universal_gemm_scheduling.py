@@ -790,10 +790,17 @@ class NVUniversalGemmScheduling(NVGemmEpilogueLowering, BaseScheduling):
         if epilogue_program.has_composite_generated_reduction_plan:
             log.debug("NVGEMM direct EFC supports one generated reduction")
             return NVGemmVerticalFusionDecision.DEFER
-        if reduction_plan is not None and not all(
-            variant.supports_reduction(reduction_plan) for variant in variants
-        ):
-            return NVGemmVerticalFusionDecision.DEFER
+        if reduction_plan is not None:
+            output_name = reduction_plan.reduction_output
+            if output_name is not None:
+                output_dtype = V.graph.get_dtype(output_name)
+                if output_dtype != torch.float32:
+                    log.debug("NVGEMM local reduction destinations require float32")
+                    return NVGemmVerticalFusionDecision.DEFER
+            if not all(
+                variant.supports_reduction(reduction_plan) for variant in variants
+            ):
+                return NVGemmVerticalFusionDecision.DEFER
         if isinstance(ir_node, MultiTemplateBuffer) and not any(
             isinstance(choice, NVUniversalGemmCaller)
             and choice.supports_epilogue_fusion

@@ -297,6 +297,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
             output_scale=output_scale,
             fallback_fn=disk_fallback,
             cc=_current_target_sm(dev_idx).cc,
+            symbolic_shapes=self.symbolic_shapes,
         )
 
         if was_compiled:
@@ -357,6 +358,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
             has_epilogue=True,
             aux_tensors=(bias,),
             epilogue_source=_NVGEMM_BIAS_ADD_EPILOGUE_FINGERPRINT,
+            epilogue_args=epilogue_args,
             logical_m=out.shape[-2],
             symbolic_shapes=self.symbolic_shapes,
         )
@@ -398,6 +400,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
             fallback_fn=disk_fallback,
             base_kernel=self.kernel,
             cc=_current_target_sm(dev_idx).cc,
+            symbolic_shapes=self.symbolic_shapes,
         )
 
         if was_compiled:
@@ -490,16 +493,11 @@ class NVUniversalGemmCaller(ChoiceCaller):
         self._kernel_layout = kernel_layout or layout
         self._cached_output_node: TensorBox | None = None
         operand_layouts = [(node.get_size(), node.get_stride()) for node in input_nodes]
-        self.symbolic_shapes = (
-            variant == GemmVariant.GEMM
-            and len(layout.size) == 2
-            and bias_node is None
-            and has_free_symbols((operand_layouts, layout.size, layout.stride))
+        self.symbolic_shapes = variant == GemmVariant.GEMM and has_free_symbols(
+            (operand_layouts, layout.size, layout.stride)
         )
 
         output_buffer = Buffer(name=f"{variant.op_name}_out", layout=layout)
-
-        self.supports_epilogue_fusion &= not self.symbolic_shapes
 
         self.bmreq = NVUniversalGemmBenchmarkRequest(
             kernel_name=name,
@@ -560,25 +558,26 @@ class NVUniversalGemmCaller(ChoiceCaller):
         return major_dim
 
     @classmethod
-    def _tensor_constraint_checks(cls, size, stride, offset, itemsize, constraint):
+    def _tensor_constraint_checks(cls, size, stride, offset, dtype, constraint):
         major_dim = cls._constraint_major_dim(size, stride, constraint)
+        divisor = cls._storage_divisibility(dtype, constraint.divisibility)
         yield (
             sympy.Eq(stride[major_dim], 1),
             "selected NVGEMM operand is not contiguous",
         )
-        if constraint.divisibility > 1:
+        if divisor > 1:
             yield (
-                sympy.Eq(sympy.Mod(size[major_dim], constraint.divisibility), 0),
+                sympy.Eq(sympy.Mod(size[major_dim], divisor), 0),
                 "selected NVGEMM operand extent violates alignment",
             )
             for dim, step in enumerate(stride):
                 if dim != major_dim:
                     yield (
-                        sympy.Eq(sympy.Mod(step, constraint.divisibility), 0),
+                        sympy.Eq(sympy.Mod(step, divisor), 0),
                         "selected NVGEMM operand stride violates alignment",
                     )
         if constraint.ptr_alignment_bytes > 1:
-            offset_bytes = offset * itemsize
+            offset_bytes = offset * dtype.itemsize
             yield (
                 sympy.Eq(sympy.Mod(offset_bytes, constraint.ptr_alignment_bytes), 0),
                 "selected NVGEMM operand pointer is misaligned",
@@ -586,23 +585,21 @@ class NVUniversalGemmCaller(ChoiceCaller):
 
     @classmethod
     def _tensor_constraint_satisfied(
-        cls, size, stride, offset, itemsize, constraint
+        cls, size, stride, offset, dtype, constraint
     ) -> bool:
         if free_unbacked_symbols((size, stride, offset)):
             return False
         return all(
             cls._shape_constraint_satisfied(condition)
             for condition, _ in cls._tensor_constraint_checks(
-                size, stride, offset, itemsize, constraint
+                size, stride, offset, dtype, constraint
             )
         )
 
     @classmethod
-    def _guard_tensor_constraint(
-        cls, size, stride, offset, itemsize, constraint
-    ) -> None:
+    def _guard_tensor_constraint(cls, size, stride, offset, dtype, constraint) -> None:
         for condition, message in cls._tensor_constraint_checks(
-            size, stride, offset, itemsize, constraint
+            size, stride, offset, dtype, constraint
         ):
             if not cls._guard_or_prove_shape_constraint(condition):
                 raise AssertionError(message)
@@ -640,28 +637,56 @@ class NVUniversalGemmCaller(ChoiceCaller):
         return size, stride
 
     def _operand_constraints(self):
-        if self.variant != GemmVariant.GEMM:
-            return
+        r"""_operand_constraints() -> Iterator[tuple]
 
+        Yield operand geometry and metadata in the kernel's physical orientation.
+        CUDA scaled-MM meta checks enforce contiguous scale storage and its
+        element count. Scales use the same flat storage view as runtime arguments.
+        """
         operands = self.kernel.metadata.operands
-        a_idx, b_idx = (1, 0) if self.swap_ab else (0, 1)
-        for node, constraint in (
-            (self.input_nodes[a_idx], operands.A),
-            (self.input_nodes[b_idx], operands.B),
-        ):
-            size, stride = self._tensor_geometry(node, self.swap_ab)
-            yield (
-                size,
-                stride,
-                node.get_layout().offset,
-                node.get_dtype().itemsize,
-                constraint,
+        if self.variant == GemmVariant.GROUPED_GEMM:
+            operand_nodes = (
+                (self.input_nodes[0], operands.A, False),
+                (self.input_nodes[1], operands.B, False),
+                (self.input_nodes[2], operands.offsets, False),
             )
+        else:
+            a_idx, b_idx = (1, 0) if self.swap_ab else (0, 1)
+            scaled = self.variant == GemmVariant.SCALED_GEMM
+            operand_nodes = [
+                (
+                    self.input_nodes[a_idx],
+                    operands.A.quantized if scaled else operands.A,
+                    self.swap_ab,
+                ),
+                (
+                    self.input_nodes[b_idx],
+                    operands.B.quantized if scaled else operands.B,
+                    self.swap_ab,
+                ),
+            ]
+        for node, constraint, transpose in operand_nodes:
+            size, stride = self._tensor_geometry(node, transpose)
+            layout = node.get_layout()
+            yield size, stride, layout.offset, node.get_dtype(), constraint
+        if self.variant == GemmVariant.SCALED_GEMM:
+            scale_a_idx, scale_b_idx = (3, 2) if self.swap_ab else (2, 3)
+            for node, constraint in (
+                (self.input_nodes[scale_a_idx], operands.A.scale),
+                (self.input_nodes[scale_b_idx], operands.B.scale),
+            ):
+                yield (
+                    [sympy.prod(node.get_size())],
+                    [1],
+                    node.get_layout().offset,
+                    node.get_dtype(),
+                    constraint,
+                )
         yield (
             self._kernel_layout.size,
             self._kernel_layout.stride,
             self._kernel_layout.offset,
-            self._kernel_layout.dtype.itemsize,
+            self._kernel_layout.dtype,
             operands.out,
         )
 
@@ -673,8 +698,6 @@ class NVUniversalGemmCaller(ChoiceCaller):
                 raise AssertionError(message)
 
     def _problem_shape_checks(self):
-        if self.variant != GemmVariant.GEMM:
-            return
         if minimums := self._preferred_cluster_minimums():
             for extent, minimum in zip(
                 self._kernel_layout.size[-2:], minimums, strict=True
@@ -683,6 +706,12 @@ class NVUniversalGemmCaller(ChoiceCaller):
                     sympy.Ge(extent, minimum),
                     "selected NVGEMM preferred cluster exceeds problem shape",
                 )
+        maximum = self._narrow_n_maximum()
+        if maximum is not None:
+            yield (
+                sympy.Le(self._kernel_layout.size[-1], maximum),
+                "selected NVGEMM problem N exceeds narrow-N tile",
+            )
 
     def _preferred_cluster_minimums(self) -> tuple[int, int] | None:
         design = self.kernel.metadata.design
@@ -699,10 +728,10 @@ class NVUniversalGemmCaller(ChoiceCaller):
         if self.symbolic_shapes and self.workspace_size != 0:
             return False
         for geometry in self._operand_constraints():
-            _, _, _, itemsize, constraint = geometry
+            _, _, _, dtype, constraint = geometry
             if self.symbolic_shapes:
                 alignment = constraint.ptr_alignment_bytes
-                divisibility_bytes = constraint.divisibility * itemsize
+                divisibility_bytes = constraint.divisibility * dtype.itemsize
                 if (
                     alignment < 16
                     or alignment % 16
@@ -917,6 +946,31 @@ class NVUniversalGemmCaller(ChoiceCaller):
             return render_kernel, render
 
         return make_kernel_render
+
+    @staticmethod
+    def _storage_divisibility(dtype, logical_divisibility: int) -> int:
+        if logical_divisibility <= 1:
+            return 1
+        from cutlass.operators.utils.dtype import (
+            cutlass_type_from_torch_type,
+            torch_storage_packing_factor,
+        )
+
+        packing = torch_storage_packing_factor(cutlass_type_from_torch_type(dtype))
+        if logical_divisibility % packing:
+            raise AssertionError("NVGEMM divisibility is not storage-aligned")
+        return max(logical_divisibility // packing, 1)
+
+    def _narrow_n_maximum(self) -> int | None:
+        r"""_narrow_n_maximum() -> int or None
+
+        Return the kernel's inclusive output-N bound, or ``None`` for no bound.
+        The optional kernel capability ``narrow_n_maximum()`` uses physical
+        kernel dimensions; swapped choices therefore bound the original M.
+        Candidate filtering and selected-kernel guards share this contract.
+        """
+        narrow_n_maximum = getattr(self.kernel, "narrow_n_maximum", None)
+        return narrow_n_maximum() if narrow_n_maximum is not None else None
 
 
 def _create_dummy_tensor_from_layout(
@@ -1507,21 +1561,9 @@ def add_nv_universal_scaled_gemm_choices(
     # The transposed mat_a is (K/2, M) column-major.
     # Both have the same layout pattern as the original (row-major A, column-major B).
 
-    # Scale inference: new A is the original weight (N, K/2), no transpose.
-    # For infer_scale_swizzle_ir, we need to pass the un-transposed shape.
-    # mat_b.t() gives (N, K/2) — but we use transpose=True on mat_b itself
-    # since mat_b is (K/2, N), so transpose=True flips it to (N, K/2).
-    swap_scale_type_a, swap_swizzle_type_a = infer_scale_swizzle_ir(
-        mat_b, scale_b, transpose=True
-    )
-    # New B is the original activation (M, K/2), used transposed as (K/2, M).
-    # infer_scale_swizzle_ir with transpose=True on mat_a flips (M, K/2) to (K/2, M).
-    swap_scale_type_b, swap_swizzle_type_b = infer_scale_swizzle_ir(
-        mat_a, scale_a, transpose=True
-    )
-
-    if swap_scale_type_a is None or swap_scale_type_b is None:
-        return
+    # Swapping operands swaps their scale recipes; scale data is unchanged.
+    swap_scale_type_a, swap_swizzle_type_a = scale_type_b, swizzle_type_b
+    swap_scale_type_b, swap_swizzle_type_b = scale_type_a, swizzle_type_a
 
     # Kernel output shape is (N, M) — the transpose of the original (M, N)
     swap_kernel_layout = _transposed_kernel_layout(layout)
